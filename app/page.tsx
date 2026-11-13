@@ -1,306 +1,340 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import type { Stats, ConnectionSuggestion, ErrorLog } from '../types/shared';
-import { SETTINGS_KEY } from '../types/shared';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type {
+  AnalyzeError,
+  AnalyzeResponse,
+  ErrorLog,
+  Stats,
+} from '../types/shared';
+import { AUTO_INTERVAL_MS, STORAGE_KEY } from '../types/shared';
 
-export default function LinkedInAutomator() {
-  const [isActive, setIsActive] = useState(false);
+const EMPTY_STATS: Stats = {
+  analyses: 0,
+  connectionsSuggested: 0,
+  postsFlagged: 0,
+  lastActivity: 'No activity yet',
+  lastRun: 0,
+};
+
+function load<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(`${STORAGE_KEY}-${key}`);
+    return raw ? (JSON.parse(raw) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function save(key: string, value: unknown) {
+  try {
+    localStorage.setItem(`${STORAGE_KEY}-${key}`, JSON.stringify(value));
+  } catch {
+    /* storage full or blocked: keep working without saving */
+  }
+}
+
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      onClick={async () => {
+        try {
+          await navigator.clipboard.writeText(text);
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1500);
+        } catch {
+          /* clipboard blocked */
+        }
+      }}
+      className="text-xs font-medium px-2 py-1 rounded bg-white border border-gray-300 hover:bg-gray-100"
+    >
+      {copied ? 'Copied' : 'Copy'}
+    </button>
+  );
+}
+
+export default function LinkedInAssistant() {
+  const [autoMode, setAutoMode] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<string>('');
-  const [stats, setStats] = useState<Stats>({
-    connectionsSuggested: 0,
-    postsLiked: 0,
-    messagesSent: 0,
-    lastActivity: 'No activity yet',
-    lastRun: 0
-  });
-  const [suggestions, setSuggestions] = useState<ConnectionSuggestion[]>([]);
+  const [notice, setNotice] = useState<{ kind: 'info' | 'error'; text: string } | null>(null);
+  const [stats, setStats] = useState<Stats>(EMPTY_STATS);
+  const [latest, setLatest] = useState<AnalyzeResponse | null>(null);
   const [errorLog, setErrorLog] = useState<ErrorLog[]>([]);
+  const busy = useRef(false);
 
-  // Load state from localStorage on mount
   useEffect(() => {
-    const loadState = () => {
-      try {
-        const savedEnabled = localStorage.getItem(`${SETTINGS_KEY}-enabled`);
-        const savedStats = localStorage.getItem(`${SETTINGS_KEY}-stats`);
-        const savedSuggestions = localStorage.getItem(`${SETTINGS_KEY}-suggestions`);
-        const savedErrors = localStorage.getItem(`${SETTINGS_KEY}-errors`);
-
-        if (savedEnabled !== null) {
-          setIsActive(savedEnabled === 'true');
-        }
-
-        if (savedStats) {
-          setStats(JSON.parse(savedStats));
-        }
-
-        if (savedSuggestions) {
-          setSuggestions(JSON.parse(savedSuggestions));
-        }
-
-        if (savedErrors) {
-          setErrorLog(JSON.parse(savedErrors));
-        }
-      } catch (err) {
-        console.error('Failed to load state:', err);
-        setError('Failed to load saved state');
-      }
-    };
-
-    loadState();
-
-    // Poll for updates every 5 seconds
-    const interval = setInterval(loadState, 5000);
-
-    return () => clearInterval(interval);
+    setStats(load('stats', EMPTY_STATS));
+    setLatest(load<AnalyzeResponse | null>('latest', null));
+    setErrorLog(load<ErrorLog[]>('errors', []));
+    setAutoMode(load('auto', false));
   }, []);
 
-  const handleToggleAutomation = async () => {
-    setIsLoading(true);
-    setError('');
+  const logError = useCallback((error: string) => {
+    setErrorLog((prev) => {
+      const next = [...prev, { timestamp: new Date().toISOString(), error }].slice(-10);
+      save('errors', next);
+      return next;
+    });
+  }, []);
 
-    try {
-      const newState = !isActive;
+  const analyze = useCallback(
+    async (silent = false) => {
+      if (busy.current) return;
+      busy.current = true;
+      setIsLoading(true);
+      if (!silent) setNotice(null);
+      try {
+        const res = await fetch('/api/analyze', { method: 'POST' });
+        const body = (await res.json()) as AnalyzeResponse | AnalyzeError;
 
-      // Save to localStorage (in a real Screenpipe integration, this would use pipe.settings)
-      localStorage.setItem(`${SETTINGS_KEY}-enabled`, String(newState));
+        if (!body.ok) {
+          // Not seeing LinkedIn, or waiting on the rate limit, is normal in Auto mode.
+          const routine = ['no-linkedin', 'unsupported-page', 'rate-limited'].includes(body.code);
+          if (!silent || !routine) setNotice({ kind: routine ? 'info' : 'error', text: body.message });
+          if (!routine) logError(body.message);
+          return;
+        }
 
-      setIsActive(newState);
+        setLatest(body);
+        save('latest', body);
+        setNotice(null);
+        setStats((prev) => {
+          const r = body.result;
+          const next: Stats = {
+            analyses: prev.analyses + 1,
+            connectionsSuggested:
+              prev.connectionsSuggested +
+              (r.pageType === 'people-search'
+                ? r.suggestions.length
+                : r.pageType === 'profile' && r.profile.shouldConnect
+                  ? 1
+                  : 0),
+            postsFlagged:
+              prev.postsFlagged + (r.pageType === 'feed' && r.post.worthEngaging ? 1 : 0),
+            lastActivity: `Analysed a ${r.pageType.replace('-', ' ')} page`,
+            lastRun: Date.now(),
+          };
+          save('stats', next);
+          return next;
+        });
+      } catch {
+        const text = 'Could not reach the local server. Is `bun dev` still running?';
+        setNotice({ kind: 'error', text });
+        logError(text);
+      } finally {
+        busy.current = false;
+        setIsLoading(false);
+      }
+    },
+    [logError]
+  );
 
-      const activity = `Automation ${newState ? 'started' : 'stopped'} at ${new Date().toLocaleTimeString()}`;
+  // Auto mode: re-check on a timer, only while this tab is open and visible.
+  useEffect(() => {
+    if (!autoMode) return;
+    const tick = () => {
+      if (document.visibilityState === 'visible') analyze(true);
+    };
+    const id = setInterval(tick, AUTO_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [autoMode, analyze]);
 
-      const updatedStats = {
-        ...stats,
-        lastActivity: activity
-      };
+  const toggleAuto = () => {
+    const next = !autoMode;
+    setAutoMode(next);
+    save('auto', next);
+  };
 
-      setStats(updatedStats);
-      localStorage.setItem(`${SETTINGS_KEY}-stats`, JSON.stringify(updatedStats));
-    } catch (err) {
-      console.error('Failed to toggle automation:', err);
-      setError('Failed to toggle automation. Please try again.');
-    } finally {
-      setIsLoading(false);
+  const resetAll = () => {
+    setStats(EMPTY_STATS);
+    setLatest(null);
+    setErrorLog([]);
+    setNotice(null);
+    for (const k of ['stats', 'latest', 'errors']) {
+      try {
+        localStorage.removeItem(`${STORAGE_KEY}-${k}`);
+      } catch {
+        /* ignore */
+      }
     }
   };
 
-  const handleResetStats = () => {
-    const resetStats: Stats = {
-      connectionsSuggested: 0,
-      postsLiked: 0,
-      messagesSent: 0,
-      lastActivity: 'Stats reset',
-      lastRun: 0
-    };
-
-    setStats(resetStats);
-    setSuggestions([]);
-    setErrorLog([]);
-
-    localStorage.setItem(`${SETTINGS_KEY}-stats`, JSON.stringify(resetStats));
-    localStorage.removeItem(`${SETTINGS_KEY}-suggestions`);
-    localStorage.removeItem(`${SETTINGS_KEY}-errors`);
-  };
-
-  const formatTimestamp = (timestamp: number) => {
-    if (!timestamp) return 'Never';
-    return new Date(timestamp).toLocaleString();
-  };
+  const r = latest?.result;
 
   return (
-    <div className="min-h-screen bg-gray-50 p-8">
+    <main className="min-h-screen bg-gray-50 p-4 sm:p-8">
       <div className="max-w-4xl mx-auto space-y-6">
-        {/* Header Card */}
-        <div className="bg-white rounded-lg shadow-lg p-6">
-          <div className="flex items-center justify-between mb-6">
+        <section className="bg-white rounded-lg shadow p-6">
+          <div className="flex flex-wrap items-center justify-between gap-4 mb-6">
             <div>
-              <h1 className="text-3xl font-bold text-gray-900">GR LinkedIn Automator</h1>
-              <p className="text-gray-600 mt-2">AI-powered LinkedIn business development automation</p>
+              <h1 className="text-3xl font-bold text-gray-900">GR LinkedIn Assistant</h1>
+              <p className="text-gray-600 mt-2">
+                Suggestions for the LinkedIn page you are viewing. You decide what to do.
+              </p>
             </div>
-            <div className="flex items-center space-x-4">
-              <div className={`w-4 h-4 rounded-full ${isActive ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`}></div>
-              <span className="text-sm font-medium">
-                {isActive ? 'Active' : 'Inactive'}
-              </span>
+            <div className="flex items-center gap-2" aria-live="polite">
+              <span
+                className={`w-3 h-3 rounded-full ${autoMode ? 'bg-green-500 animate-pulse' : 'bg-gray-400'}`}
+              />
+              <span className="text-sm font-medium">{autoMode ? 'Auto on' : 'Auto off'}</span>
             </div>
           </div>
 
-          {/* Error Display */}
-          {error && (
-            <div className="mb-4 bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg">
-              <p className="text-sm font-medium">Error: {error}</p>
+          {notice && (
+            <div
+              role="status"
+              className={`mb-4 px-4 py-3 rounded-lg border text-sm ${
+                notice.kind === 'error'
+                  ? 'bg-red-50 border-red-200 text-red-700'
+                  : 'bg-blue-50 border-blue-200 text-blue-800'
+              }`}
+            >
+              {notice.text}
             </div>
           )}
 
-          {/* Stats Grid */}
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
             <div className="bg-blue-50 p-4 rounded-lg">
-              <h3 className="font-semibold text-blue-900 mb-2">Connections</h3>
-              <p className="text-3xl font-bold text-blue-600">{stats.connectionsSuggested}</p>
-              <p className="text-xs text-blue-700 mt-1">Suggested today</p>
+              <h2 className="font-semibold text-blue-900">Analyses</h2>
+              <p className="text-3xl font-bold text-blue-600">{stats.analyses}</p>
             </div>
-
             <div className="bg-green-50 p-4 rounded-lg">
-              <h3 className="font-semibold text-green-900 mb-2">Engagement</h3>
-              <p className="text-3xl font-bold text-green-600">{stats.postsLiked}</p>
-              <p className="text-xs text-green-700 mt-1">Posts liked</p>
+              <h2 className="font-semibold text-green-900">People suggested</h2>
+              <p className="text-3xl font-bold text-green-600">{stats.connectionsSuggested}</p>
             </div>
-
             <div className="bg-purple-50 p-4 rounded-lg">
-              <h3 className="font-semibold text-purple-900 mb-2">Messages</h3>
-              <p className="text-3xl font-bold text-purple-600">{stats.messagesSent}</p>
-              <p className="text-xs text-purple-700 mt-1">Sent today</p>
+              <h2 className="font-semibold text-purple-900">Posts worth a reply</h2>
+              <p className="text-3xl font-bold text-purple-600">{stats.postsFlagged}</p>
             </div>
           </div>
 
-          {/* Control Buttons */}
-          <div className="space-y-3">
+          <div className="flex flex-col sm:flex-row gap-3">
             <button
-              onClick={handleToggleAutomation}
+              type="button"
+              onClick={() => analyze(false)}
               disabled={isLoading}
-              className={`w-full py-3 px-6 rounded-lg font-medium transition-colors ${
-                isActive
-                  ? 'bg-red-600 hover:bg-red-700 text-white'
-                  : 'bg-blue-600 hover:bg-blue-700 text-white'
-              } ${isLoading ? 'opacity-50 cursor-not-allowed' : ''}`}
+              className="flex-1 py-3 px-6 rounded-lg font-medium bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {isLoading ? 'Loading...' : (isActive ? 'Stop Automation' : 'Start Automation')}
+              {isLoading ? 'Analysing…' : 'Analyse current page'}
             </button>
-
             <button
-              onClick={handleResetStats}
-              className="w-full py-2 px-6 rounded-lg font-medium bg-gray-200 hover:bg-gray-300 text-gray-700 transition-colors text-sm"
+              type="button"
+              onClick={toggleAuto}
+              aria-pressed={autoMode}
+              className={`flex-1 py-3 px-6 rounded-lg font-medium ${
+                autoMode ? 'bg-red-600 hover:bg-red-700 text-white' : 'bg-gray-200 hover:bg-gray-300 text-gray-800'
+              }`}
             >
-              Reset Stats
+              {autoMode ? 'Stop auto mode' : 'Start auto mode (every 60 s)'}
+            </button>
+            <button
+              type="button"
+              onClick={resetAll}
+              className="py-3 px-6 rounded-lg font-medium bg-white border border-gray-300 hover:bg-gray-100 text-gray-700 text-sm"
+            >
+              Reset
             </button>
           </div>
-        </div>
+          <p className="text-xs text-gray-500 mt-3">
+            Last: {stats.lastActivity}
+            {stats.lastRun ? ` at ${new Date(stats.lastRun).toLocaleString()}` : ''}
+          </p>
+        </section>
 
-        {/* Activity Card */}
-        <div className="bg-white rounded-lg shadow-lg p-6">
-          <h3 className="font-semibold text-gray-900 mb-4">Recent Activity</h3>
-          <div className="bg-gray-50 p-4 rounded-lg">
-            <p className="text-sm text-gray-700">{stats.lastActivity}</p>
-            <p className="text-xs text-gray-500 mt-2">Last run: {formatTimestamp(stats.lastRun)}</p>
-          </div>
-        </div>
+        {latest && r && (
+          <section className="bg-white rounded-lg shadow p-6">
+            <h2 className="font-semibold text-gray-900">Latest suggestions</h2>
+            <p className="text-xs text-gray-500 mb-4 break-all">{latest.url}</p>
 
-        {/* Connection Suggestions */}
-        {suggestions.length > 0 && (
-          <div className="bg-white rounded-lg shadow-lg p-6">
-            <h3 className="font-semibold text-gray-900 mb-4">Recent Connection Suggestions</h3>
-            <div className="space-y-3">
-              {suggestions.map((suggestion, idx) => (
-                <div key={idx} className="bg-blue-50 p-4 rounded-lg border border-blue-100">
-                  <div className="flex justify-between items-start">
-                    <div>
-                      <h4 className="font-medium text-blue-900">{suggestion.name}</h4>
-                      <p className="text-sm text-blue-700">{suggestion.title}</p>
+            {r.pageType === 'people-search' &&
+              (r.suggestions.length ? (
+                <ul className="space-y-3">
+                  {r.suggestions.map((s, i) => (
+                    <li key={i} className="bg-blue-50 p-4 rounded-lg border border-blue-100">
+                      <p className="font-medium text-blue-900">{s.name}</p>
+                      <p className="text-sm text-blue-700">{s.title}</p>
+                      <p className="text-xs text-blue-600 mt-2">{s.reason}</p>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-sm text-gray-600">No one on this page looked like a strong fit.</p>
+              ))}
+
+            {r.pageType === 'feed' && (
+              <div className="bg-green-50 p-4 rounded-lg border border-green-100 space-y-2">
+                <p className="font-medium text-green-900">
+                  {r.post.worthEngaging ? 'Worth engaging with' : 'Probably skip this one'}
+                </p>
+                <p className="text-sm text-green-800">{r.post.reason}</p>
+                {r.post.commentDraft && (
+                  <div className="bg-white p-3 rounded border border-green-200">
+                    <div className="flex justify-between items-center mb-1">
+                      <span className="text-xs font-semibold text-gray-500">Draft comment (edit before posting)</span>
+                      <CopyButton text={r.post.commentDraft} />
                     </div>
+                    <p className="text-sm text-gray-800">{r.post.commentDraft}</p>
                   </div>
-                  <p className="text-xs text-blue-600 mt-2">{suggestion.reason}</p>
-                </div>
-              ))}
-            </div>
-          </div>
+                )}
+              </div>
+            )}
+
+            {r.pageType === 'profile' && (
+              <div className="bg-yellow-50 p-4 rounded-lg border border-yellow-100 space-y-2">
+                <p className="font-medium text-yellow-900">
+                  {r.profile.shouldConnect ? 'Good connection' : 'Not an obvious fit'}
+                </p>
+                <p className="text-sm text-yellow-800">{r.profile.reason}</p>
+                {r.profile.message && (
+                  <div className="bg-white p-3 rounded border border-yellow-200">
+                    <div className="flex justify-between items-center mb-1">
+                      <span className="text-xs font-semibold text-gray-500">Draft note (edit before sending)</span>
+                      <CopyButton text={r.profile.message} />
+                    </div>
+                    <p className="text-sm text-gray-800">{r.profile.message}</p>
+                  </div>
+                )}
+              </div>
+            )}
+          </section>
         )}
 
-        {/* Error Log */}
         {errorLog.length > 0 && (
-          <div className="bg-white rounded-lg shadow-lg p-6">
-            <h3 className="font-semibold text-gray-900 mb-4">Error Log</h3>
-            <div className="space-y-2">
-              {errorLog.slice(-5).reverse().map((log, idx) => (
-                <div key={idx} className="bg-red-50 p-3 rounded-lg border border-red-100">
-                  <p className="text-xs text-red-600 font-mono">{log.error}</p>
-                  <p className="text-xs text-red-500 mt-1">{log.timestamp}</p>
-                </div>
-              ))}
-            </div>
-          </div>
+          <section className="bg-white rounded-lg shadow p-6">
+            <h2 className="font-semibold text-gray-900 mb-4">Error log</h2>
+            <ul className="space-y-2">
+              {errorLog
+                .slice(-5)
+                .reverse()
+                .map((log, i) => (
+                  <li key={i} className="bg-red-50 p-3 rounded-lg border border-red-100">
+                    <p className="text-xs text-red-700 font-mono">{log.error}</p>
+                    <p className="text-xs text-red-500 mt-1">{new Date(log.timestamp).toLocaleString()}</p>
+                  </li>
+                ))}
+            </ul>
+          </section>
         )}
 
-        {/* Features Card */}
-        <div className="bg-white rounded-lg shadow-lg p-6">
-          <h3 className="font-semibold text-gray-900 mb-4">Automation Features</h3>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div className="flex items-start space-x-3">
-              <div className="flex-shrink-0 w-8 h-8 bg-blue-100 rounded-lg flex items-center justify-center">
-                <span className="text-blue-600 font-bold">🤝</span>
-              </div>
-              <div>
-                <h4 className="font-medium text-gray-900">Smart Connections</h4>
-                <p className="text-sm text-gray-600">AI identifies relevant professionals to connect with</p>
-              </div>
-            </div>
-
-            <div className="flex items-start space-x-3">
-              <div className="flex-shrink-0 w-8 h-8 bg-green-100 rounded-lg flex items-center justify-center">
-                <span className="text-green-600 font-bold">👍</span>
-              </div>
-              <div>
-                <h4 className="font-medium text-gray-900">Post Engagement</h4>
-                <p className="text-sm text-gray-600">Automatically like relevant industry posts</p>
-              </div>
-            </div>
-
-            <div className="flex items-start space-x-3">
-              <div className="flex-shrink-0 w-8 h-8 bg-purple-100 rounded-lg flex items-center justify-center">
-                <span className="text-purple-600 font-bold">✉️</span>
-              </div>
-              <div>
-                <h4 className="font-medium text-gray-900">Message Templates</h4>
-                <p className="text-sm text-gray-600">Generate personalized outreach messages</p>
-              </div>
-            </div>
-
-            <div className="flex items-start space-x-3">
-              <div className="flex-shrink-0 w-8 h-8 bg-yellow-100 rounded-lg flex items-center justify-center">
-                <span className="text-yellow-600 font-bold">📊</span>
-              </div>
-              <div>
-                <h4 className="font-medium text-gray-900">Profile Analysis</h4>
-                <p className="text-sm text-gray-600">Analyze profiles for connection opportunities</p>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* How it Works */}
-        <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-6">
-          <h4 className="font-medium text-yellow-900 mb-3">How it works</h4>
-          <div className="space-y-2 text-sm text-yellow-800">
-            <p>
-              1. <strong>Real-time Monitoring:</strong> The automation continuously monitors your LinkedIn activity
-            </p>
-            <p>
-              2. <strong>AI Analysis:</strong> Uses advanced AI to analyze profiles, posts, and opportunities
-            </p>
-            <p>
-              3. <strong>Smart Suggestions:</strong> Provides intelligent recommendations for connections and engagement
-            </p>
-            <p>
-              4. <strong>Rate Limiting:</strong> Respects LinkedIn's usage patterns with 30-second cooldowns
-            </p>
-            <p className="mt-4 text-xs text-yellow-700">
-              <strong>Note:</strong> Make sure you're logged into LinkedIn in your browser. The pipe runs through Screenpipe and analyzes page content in real-time.
-            </p>
-          </div>
-        </div>
-
-        {/* Safety Notice */}
-        <div className="bg-gray-100 border border-gray-300 rounded-lg p-6">
-          <h4 className="font-medium text-gray-900 mb-3">Safety & Compliance</h4>
-          <ul className="space-y-2 text-sm text-gray-700">
-            <li>✓ Only suggests actions - manual approval required</li>
-            <li>✓ Respects LinkedIn's terms of service</li>
-            <li>✓ Built-in rate limiting (30s between actions)</li>
-            <li>✓ Conservative AI recommendations</li>
-            <li>✓ Full activity logging and transparency</li>
+        <section className="bg-gray-100 border border-gray-300 rounded-lg p-6">
+          <h2 className="font-medium text-gray-900 mb-3">How it works and what it will not do</h2>
+          <ul className="space-y-2 text-sm text-gray-700 list-disc pl-5">
+            <li>Screenpipe records your screen locally. This app reads the latest LinkedIn page from it.</li>
+            <li>Works on people search results, your feed, and profile pages.</li>
+            <li>
+              Page text goes to the AI service set in <code>.env.local</code> (a local Ollama model by default).
+            </li>
+            <li>
+              It never clicks, likes, comments, connects or sends messages. Draft text is for you to edit and
+              post yourself. Automating those actions is against LinkedIn&apos;s User Agreement and can get an
+              account restricted.
+            </li>
+            <li>At most one analysis every 30 seconds.</li>
           </ul>
-        </div>
+        </section>
       </div>
-    </div>
+    </main>
   );
 }
