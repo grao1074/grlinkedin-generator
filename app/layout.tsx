@@ -5,8 +5,8 @@ import './globals.css'
 const inter = Inter({ subsets: ['latin'] })
 
 export const metadata: Metadata = {
-  title: 'GR LinkedIn Automator',
-  description: 'Automate your LinkedIn business development activities',
+  title: 'GR LinkedIn Assistant',
+  description: 'AI suggestions for the LinkedIn page you are viewing',
 }
 
 export default function RootLayout({
