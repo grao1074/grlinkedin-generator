@@ -8,6 +8,7 @@ import type {
   Stats,
 } from '../types/shared';
 import { AUTO_INTERVAL_MS, STORAGE_KEY } from '../types/shared';
+import { CopyButton } from './components/CopyButton';
 
 const EMPTY_STATS: Stats = {
   analyses: 0,
@@ -32,27 +33,6 @@ function save(key: string, value: unknown) {
   } catch {
     /* storage full or blocked: keep working without saving */
   }
-}
-
-function CopyButton({ text }: { text: string }) {
-  const [copied, setCopied] = useState(false);
-  return (
-    <button
-      type="button"
-      onClick={async () => {
-        try {
-          await navigator.clipboard.writeText(text);
-          setCopied(true);
-          setTimeout(() => setCopied(false), 1500);
-        } catch {
-          /* clipboard blocked */
-        }
-      }}
-      className="text-xs font-medium px-2 py-1 rounded bg-white border border-gray-300 hover:bg-gray-100"
-    >
-      {copied ? 'Copied' : 'Copy'}
-    </button>
-  );
 }
 
 export default function LinkedInAssistant() {
@@ -164,7 +144,7 @@ export default function LinkedInAssistant() {
   const r = latest?.result;
 
   return (
-    <main className="min-h-screen bg-gray-50 p-4 sm:p-8">
+    <main className="min-h-screen p-4 sm:p-8">
       <div className="max-w-4xl mx-auto space-y-6">
         <section className="bg-white rounded-lg shadow p-6">
           <div className="flex flex-wrap items-center justify-between gap-4 mb-6">

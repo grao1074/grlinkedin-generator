@@ -34,3 +34,6 @@ next-env.d.ts
 
 # Bun
 bun.lockb
+
+# Outreach data (leads, drafts, cache) stays on this computer
+/data/

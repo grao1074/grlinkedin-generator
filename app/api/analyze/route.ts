@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { buildMessages, detectPageType, parseResult } from '../../../lib/linkedin';
 import { latestLinkedInCapture, ScreenpipeUnreachableError } from '../../../lib/screenpipe';
 import { AiError, chat } from '../../../lib/ai';
+import { rejectCrossSite } from '../../../lib/http';
 import { RATE_LIMIT_MS, type AnalyzeError, type AnalyzeResponse } from '../../../types/shared';
 
 export const runtime = 'nodejs';
@@ -22,11 +23,8 @@ function fail(code: AnalyzeError['code'], message: string, status: number) {
 export async function POST(request: Request) {
   // Only answer requests from this dashboard, so another website open in
   // your browser cannot trigger analyses of your screen.
-  const origin = request.headers.get('origin');
-  const host = request.headers.get('host');
-  if (origin && host && new URL(origin).host !== host) {
-    return fail('forbidden', 'Cross-site request refused.', 403);
-  }
+  const refused = rejectCrossSite(request);
+  if (refused) return refused;
 
   const now = Date.now();
   const wait = lastRun + RATE_LIMIT_MS - now;
