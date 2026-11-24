@@ -8,7 +8,9 @@
     "start": "next start -H 127.0.0.1",
     "lint": "eslint .",
     "type-check": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "google:auth": "bun scripts/google-auth.ts",
+    "demo": "OUTREACH_MOCK=1 next dev -H 127.0.0.1"
   },
   "dependencies": {
     "next": "^15.5.29",
